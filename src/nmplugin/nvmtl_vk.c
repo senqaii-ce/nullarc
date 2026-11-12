@@ -451,11 +451,29 @@ int nvmtl_vk_pipeline_stats(void *pipe, char *out, size_t n)
     }
     return 0;
 }
+// RADV's disk cache can hold a compute pipeline entry with no shader in it (seen in Safari's GPU process: 8-byte
+// entries, written seconds before each crash). Its lookup then takes shader 0 of that entry without a check and the
+// process dies in radv_compute_pipeline_cache_search - every later Safari video frame copy (VideoToolbox's
+// VTMTSComputeFunction) hits the same entry again. Until Mesa is patched, compute pipelines on RADV are created with
+// CAPTURE_STATISTICS, which makes RADV skip both the lookup and the insert; the kernel is compiled by ACO each time
+// (about 20 ms for VideoToolbox's). NVMTL_RADV_COMPUTE_CACHE=1 restores the cached path.
+static VkResult nvmtl_compute_pipeline_vk(VkDevice dev, const VkComputePipelineCreateInfo *info, VkPipeline *handle)
+{
+    static int skip = -1;
+    if (skip < 0) {
+        const char *e = getenv("NVMTL_RADV_COMPUTE_CACHE");
+        skip = nvmtl_vk_vendor() == 0x1002 && !(e && *e == '1');
+        if (skip) nvlog("vk: compute pipelines bypass RADV's pipeline cache (an entry without a shader crashes its lookup; NVMTL_RADV_COMPUTE_CACHE=1 undoes this)");
+    }
+    VkComputePipelineCreateInfo own;
+    if (skip) { own = *info; own.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR; info = &own; }
+    return pvkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, info, NULL, handle);
+}
 static VkResult nvmtl_opaque_CreateComputePipelines(VkDevice dev, VkPipelineCache cache, uint32_t count, const VkComputePipelineCreateInfo *info, const VkAllocationCallbacks *allocator, void **out)
 {
     if (count != 1) return VK_ERROR_INITIALIZATION_FAILED;
     VkPipeline handle = VK_NULL_HANDLE;
-    VkResult result = pvkCreateComputePipelines(dev, cache, count, info, allocator, &handle);
+    VkResult result = (cache || allocator) ? pvkCreateComputePipelines(dev, cache, count, info, allocator, &handle) : nvmtl_compute_pipeline_vk(dev, info, &handle);
     if (result == VK_SUCCESS) *out = handle;
     else if (handle) pvkDestroyPipeline(dev, handle, allocator);
     return result;
@@ -4436,7 +4454,7 @@ static VkPipeline nvmtl_compute_variant(nvk_pipeline *p, const uint32_t l[3])
         VkComputePipelineCreateInfo cpi = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
             { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, (VkShaderModule)p->mod, "main", &si },
             (VkPipelineLayout)p->layout, VK_NULL_HANDLE, -1 };
-        VkResult r = pvkCreateComputePipelines(g_dev, VK_NULL_HANDLE, 1, &cpi, NULL, &found);
+        VkResult r = nvmtl_compute_pipeline_vk(g_dev, &cpi, &found);
         if (r != VK_SUCCESS) {
             if (found) pvkDestroyPipeline(g_dev, found, NULL);
             nvlog("vk: compute variant %ux%ux%u -> %d — this dispatch is SKIPPED", l[0], l[1], l[2], r); found = VK_NULL_HANDLE;

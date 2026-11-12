@@ -20,6 +20,7 @@ jobs:
         run: |
           B=src/nmplugin/NVMTLDriver.new
           lipo -archs "$B" | grep -qx x86_64
+          stat -f "size %z" "$B"
           shasum -a 256 "$B" | tee "$RUNNER_TEMP/sha256.txt"
           cp "$B" "$RUNNER_TEMP/NVMTLDriver.new"
       - uses: actions/upload-artifact@v4
