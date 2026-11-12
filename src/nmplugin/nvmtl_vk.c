@@ -457,8 +457,56 @@ int nvmtl_vk_pipeline_stats(void *pipe, char *out, size_t n)
 // VTMTSComputeFunction) hits the same entry again. Until Mesa is patched, compute pipelines on RADV are created with
 // CAPTURE_STATISTICS, which makes RADV skip both the lookup and the insert; the kernel is compiled by ACO each time
 // (about 20 ms for VideoToolbox's). NVMTL_RADV_COMPUTE_CACHE=1 restores the cached path.
+// Shader-memory probe (Safari video crash, 2026-11-12). RADV uploads a new compute shader into a CPU-visible VRAM
+// arena; when that allocation fails it keeps going with a NULL shader and dies (radv_compute_pipeline_create,
+// radv_get_user_sgpr_info on NULL+0x162). Before each compute pipeline the plugin now allocates and frees a block of the
+// same kind (DEVICE_LOCAL | HOST_VISIBLE), logs every heap's budget and usage beside the outcome, and refuses the
+// pipeline when even that fails - a skipped dispatch instead of a dead GPU process. NVMTL_SHADER_PROBE=0 turns it off.
+static int nvmtl_shader_mem_probe(void)
+{
+    static int on = -1, type = -2; static _Atomic unsigned long long n, fails;
+    if (on < 0) { const char *e = getenv("NVMTL_SHADER_PROBE"); on = !(e && *e == '0'); }
+    if (!on || !g_dev) return 0;
+    if (type == -2) {
+        type = -1;
+        for (uint32_t i = 0; i < g_memp.memoryTypeCount; i++) {
+            const VkMemoryPropertyFlags f = g_memp.memoryTypes[i].propertyFlags;
+            nvlog("shader probe: memory type %u flags %#x heap %u (%llu MB, heap flags %#x)", i, f, g_memp.memoryTypes[i].heapIndex,
+                  (unsigned long long)(g_memp.memoryHeaps[g_memp.memoryTypes[i].heapIndex].size >> 20), g_memp.memoryHeaps[g_memp.memoryTypes[i].heapIndex].flags);
+            if (type < 0 && (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) type = (int)i;
+        }
+        nvlog("shader probe: ON - each compute pipeline first allocates 2 MiB of memory type %d (NVMTL_SHADER_PROBE=0 turns it off)", type);
+    }
+    if (type < 0) return 0;
+    const unsigned long long k = atomic_fetch_add(&n, 1) + 1;
+    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, 2u << 20, (uint32_t)type };
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    const VkResult r = pvkAllocateMemory(g_dev, &mai, NULL, &m);
+    if (m) pvkFreeMemory(g_dev, m, NULL);
+    char heaps[400] = ""; size_t w = 0;
+    if (g_budget_ext && pvkGetPhysicalDeviceMemoryProperties2) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT b = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT, NULL, { 0 }, { 0 } };
+        VkPhysicalDeviceMemoryProperties2 mp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b, { 0 } };
+        pvkGetPhysicalDeviceMemoryProperties2(g_pdev, &mp);
+        for (uint32_t i = 0; i < mp.memoryProperties.memoryHeapCount && w + 64 < sizeof heaps; i++) {
+            int q = snprintf(heaps + w, sizeof heaps - w, " | heap %u used %llu of budget %llu / size %llu MB", i,
+                             (unsigned long long)(b.heapUsage[i] >> 20), (unsigned long long)(b.heapBudget[i] >> 20),
+                             (unsigned long long)(mp.memoryProperties.memoryHeaps[i].size >> 20));
+            if (q > 0) w += (size_t)q;
+        }
+    }
+    if (r != VK_SUCCESS) {
+        const unsigned long long f = atomic_fetch_add(&fails, 1) + 1;
+        nvlog("shader probe #%llu: 2 MiB of type %d REFUSED (%d) - compute pipeline NOT created, its dispatch is skipped [%llu refused]%s",
+              k, type, r, f, heaps);
+        return -1;
+    }
+    if (k <= 4 || !(k % 8)) nvlog("shader probe #%llu: ok%s", k, heaps);
+    return 0;
+}
 static VkResult nvmtl_compute_pipeline_vk(VkDevice dev, const VkComputePipelineCreateInfo *info, VkPipeline *handle)
 {
+    if (nvmtl_shader_mem_probe()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     static int skip = -1;
     if (skip < 0) {
         const char *e = getenv("NVMTL_RADV_COMPUTE_CACHE");
