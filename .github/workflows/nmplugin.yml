@@ -1,0 +1,30 @@
+name: Metal plugin
+
+on:
+  push:
+    paths:
+      - "src/nmplugin/**"
+      - ".github/workflows/nmplugin.yml"
+  workflow_dispatch:
+
+jobs:
+  plugin:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$RUNNER_TEMP/Vulkan-Headers"
+          sh src/nmplugin/build.sh "$RUNNER_TEMP/Vulkan-Headers/include"
+      - name: Check the binary
+        run: |
+          B=src/nmplugin/NVMTLDriver.new
+          lipo -archs "$B" | grep -qx x86_64
+          shasum -a 256 "$B" | tee "$RUNNER_TEMP/sha256.txt"
+          cp "$B" "$RUNNER_TEMP/NVMTLDriver.new"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NVMTLDriver-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/NVMTLDriver.new
+            ${{ runner.temp }}/sha256.txt
