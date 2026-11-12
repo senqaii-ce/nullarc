@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 36u
+#define PHX_KEXT_BUILD 37u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -61,6 +61,12 @@ static int gPmGfxMax = 0;
 static int gPmUp = 70;          // governor: GFX busy % that goes straight to the top of the range
 static int gPmTarget = 50;      // governor: busy % a lower cap is sized for (cap = cap * busy / target)
 static int gPmStepDown = 300;   // governor: MHz the cap may fall per tick
+// debug.phx_pm_gfxoff: GFXOFF as Linux does it on GC 11.0.1 (gfx_v11_0_set_powergating_state): RLC_PG_CNTL
+// GFX_POWER_GATING_ENABLE + RLC_PG_DELAY_3 inside RLC safe mode, then SMU AllowGfxOff; the PMFW powers GFX down when it
+// idles and back up on a doorbell. Every GC register access of this kext (VM context binding, TLB invalidation, wave
+// kill, register reads) runs between DisallowGfxOff and a delayed AllowGfxOff (Linux amdgpu_gfx_off_ctrl).
+static int gPmGfxoff = 0;
+static int gPmGfxoffDelayMs = 100;
 static struct {
     int state;                  // 0 not started, 1 running, -1 not SMU 13.0.4, -2 no VRAM window, -3 driver table refused, -4 gave up
     int dpmMin, dpmMax;         // the PMFW's GFX range (DpmClocks_t MinGfxClk / MaxGfxClk)
@@ -69,6 +75,8 @@ static struct {
     int gfxTemp, socTemp, throttler, c0;
     int hardMin, softMax;       // what the kext last sent (0 = nothing)
     int updates, errors, vramWasZero;
+    int gfxoffState;            // 0 off, 1 GFX may power down (AllowGfxOff sent), 2 held on by a register access
+    int gfxWakes, gfxAllows;    // DisallowGfxOff / AllowGfxOff messages sent
 } gPm;
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmMs, 0, "SMU metrics period, ms (0 off)");
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_mode, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmMode, 0,
@@ -76,6 +84,10 @@ SYSCTL_INT(_debug, OID_AUTO, phx_pm_mode, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmMode,
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_gfx_max, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmGfxMax, 0, "GFX ceiling, MHz (0 DPM table)");
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_up, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmUp, 0, "governor: busy % that jumps to max");
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_target, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmTarget, 0, "governor: busy % to size the cap for");
+SYSCTL_INT(_debug, OID_AUTO, phx_pm_gfxoff, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmGfxoff, 0,
+           "GFXOFF: 1 lets the PMFW power GFX down when idle (RLC power gating + AllowGfxOff)");
+SYSCTL_INT(_debug, OID_AUTO, phx_pm_gfxoff_delay_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmGfxoffDelayMs, 0,
+           "GFXOFF: ms after the last GC register access before AllowGfxOff again");
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_step_down, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmStepDown, 0, "governor: MHz down per tick");
 #define PHX_PM_RO(name, field, desc) \
     SYSCTL_INT(_debug, OID_AUTO, name, CTLFLAG_RD | CTLFLAG_LOCKED, &gPm.field, 0, desc)
@@ -104,6 +116,9 @@ PHX_PM_RO(phx_pm_softmax, softMax, "GFX SoftMax last sent, MHz");
 PHX_PM_RO(phx_pm_updates, updates, "metrics tables read");
 PHX_PM_RO(phx_pm_errors, errors, "SMU messages that failed");
 PHX_PM_RO(phx_pm_vram_was_zero, vramWasZero, "the table page was clear before first use");
+PHX_PM_RO(phx_pm_gfxoff_state, gfxoffState, "0 off, 1 GFX may power down, 2 held on for a register access");
+PHX_PM_RO(phx_pm_gfx_wakes, gfxWakes, "DisallowGfxOff sent (GC register access while GFXOFF was allowed)");
+PHX_PM_RO(phx_pm_gfx_allows, gfxAllows, "AllowGfxOff sent");
 static struct sysctl_oid *const kPmOids[] = {
     &sysctl__debug_phx_pm_ms, &sysctl__debug_phx_pm_mode, &sysctl__debug_phx_pm_gfx_max,
     &sysctl__debug_phx_pm_up, &sysctl__debug_phx_pm_target, &sysctl__debug_phx_pm_step_down,
@@ -115,10 +130,15 @@ static struct sysctl_oid *const kPmOids[] = {
     &sysctl__debug_phx_pm_soc_mw, &sysctl__debug_phx_pm_gfx_temp, &sysctl__debug_phx_pm_soc_temp,
     &sysctl__debug_phx_pm_throttler, &sysctl__debug_phx_pm_c0, &sysctl__debug_phx_pm_hardmin,
     &sysctl__debug_phx_pm_softmax, &sysctl__debug_phx_pm_updates, &sysctl__debug_phx_pm_errors,
-    &sysctl__debug_phx_pm_vram_was_zero,
+    &sysctl__debug_phx_pm_vram_was_zero, &sysctl__debug_phx_pm_gfxoff, &sysctl__debug_phx_pm_gfxoff_delay_ms,
+    &sysctl__debug_phx_pm_gfxoff_state, &sysctl__debug_phx_pm_gfx_wakes, &sysctl__debug_phx_pm_gfx_allows,
 };
 // GC 11.0.1 registers (segment 0 base 0x1260, segment 1 base 0xa000)
 static constexpr uint32_t kRegSqCmd = 0x1260 + 0x111b, kRegRlcSafeMode = 0xa000 + 0x0980;
+static constexpr uint32_t kRegRlcPgCntl = 0xa000 + 0x4c43, kRegRlcPgDelay3 = 0xa000 + 0x4c78;
+static constexpr uint32_t kRlcPgGfxPowerGating = 1u << 0, kRlcPgSmuHandshakeDisable = 1u << 23;
+static constexpr uint32_t kRlcPgDelay3Gc1101 = 0x1388;     // RLC_PG_DELAY_3_DEFAULT_GC_11_0_1 (CGPG hysteresis)
+static constexpr uint32_t kGcRegFirst = 0x1260, kGcRegEnd = 0x12000;   // GC segments 0 and 1 (dwords)
 static volatile UInt32 gSysctlUp;
 
 // psp_gfx_rb_frame (64 B) — the ring entry the PSP reads. Only 5 fields are set; the rest stay zero
@@ -292,6 +312,21 @@ private:
     bool pmSend(uint32_t msg, uint32_t arg);
     bool pmSetRange(int lo, int hi);
     void pmPolicy(const phx_smu13_0_4_metrics &m);
+    // GFXOFF (debug.phx_pm_gfxoff): gfxAwake/gfxRelease bracket every GC register access; GfxGuard does it per scope
+    mutable IOLock *gfxLock{nullptr};
+    mutable int gfxRef{0};
+    mutable bool gfxOffAllowed{false};
+    mutable uint64_t gfxLastUse{0};
+    bool gfxPgOn{false};
+    void gfxAwake() const;
+    void gfxRelease() const;
+    void gfxoffPolicy();
+    void rlcSafeMode(bool enter) const;
+    struct GfxGuard {
+        const PhxBringup *p;
+        explicit GfxGuard(const PhxBringup *q) : p(q) { p->gfxAwake(); }
+        ~GfxGuard() { p->gfxRelease(); }
+    };
     bool debug{false};
     bool smuUsed{false};
     volatile SInt32 sessionOpen{0};
@@ -428,6 +463,7 @@ bool PhxBringup::start(IOService *provider) {
     doorbellMap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
     smuLock = IOLockAlloc();
     gpuLock = IOLockAlloc();
+    gfxLock = IOLockAlloc();
     uint32_t dbg = 0;
     debug = PE_parse_boot_argn("phxdebug", &dbg, sizeof(dbg)) && dbg == 1;
     if (mmio) {
@@ -477,6 +513,10 @@ void PhxBringup::stop(IOService *provider) {
         pmCall = nullptr;
         if (pmReady && pmModeApplied && gPm.dpmMax)
             pmSetRange(gPm.dpmMin, gPm.dpmMax);   // hand the PMFW its own range back
+        if (gfxPgOn) {
+            gPmGfxoff = 0;
+            gfxoffPolicy();                       // GFX on and RLC power gating off before the kext goes
+        }
     }
     if (gSysctlUp) {
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush);
@@ -524,6 +564,10 @@ void PhxBringup::stop(IOService *provider) {
     if (smuLock) {
         IOLockFree(smuLock);
         smuLock = nullptr;
+    }
+    if (gfxLock) {
+        IOLockFree(gfxLock);
+        gfxLock = nullptr;
     }
     PMstop();
     IOService::stop(provider);
@@ -616,6 +660,7 @@ IOReturn PhxBringup::writeReg(uint32_t reg, uint32_t value, uint32_t *readback) 
         return kIOReturnNotReady;
     if ((static_cast<uint64_t>(reg) + 1) * 4 > mmio->getLength())
         return kIOReturnBadArgument;
+    GfxGuard awake(this);
     wreg(reg, value);
     __asm__ __volatile__("mfence" ::: "memory");
     *readback = rreg(reg);
@@ -734,6 +779,7 @@ uint64_t *PhxBringup::vmPte(VmCtx &c, uint64_t va, bool alloc) {
 }
 
 void PhxBringup::vmFlushTlb(uint32_t vmid) const {
+    GfxGuard awake(this);
     __asm__ __volatile__("mfence" ::: "memory");
     wreg(kRegInvEng17Req, 0x00F80000u | (1u << vmid) | 1u);
     for (int i = 0; i < 1000 && !(rreg(kRegInvEng17Ack) & (1u << vmid)); i++)
@@ -803,6 +849,7 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
     h.lastUse = now;
     const uint32_t vmid = kFirstUserVmid + static_cast<uint32_t>(pick);
     c.hw = vmid;
+    GfxGuard awake(this);
     wreg(kRegCtx0BaseLo + 2 * vmid, static_cast<uint32_t>(c.phys | 3));
     wreg(kRegCtx0BaseLo + 2 * vmid + 1, static_cast<uint32_t>(c.phys >> 32));
     wreg(kRegCtx0Cntl + vmid, 0x01fffe07);
@@ -1084,12 +1131,22 @@ void PhxBringup::hangCheck() {
 // gfx_v11_0_ring_soft_recovery: SQ_CMD kill (CMD 3) broadcast (MODE 1), limited to one VMID unless `all`, inside RLC
 // safe mode
 void PhxBringup::killWaves(uint32_t vmid, bool all) {
-    wreg(kRegRlcSafeMode, 0x3);                        // CMD | MESSAGE 1: enter
-    for (int i = 0; i < 1000 && (rreg(kRegRlcSafeMode) & 1); i++)
-        IODelay(1);
+    GfxGuard awake(this);
+    rlcSafeMode(true);
     wreg(kRegSqCmd, 0x13u | (all ? 0u : (0x80u | (vmid & 0xfu) << 28)));
-    wreg(kRegRlcSafeMode, 0x1);                        // CMD, MESSAGE 0: exit
+    rlcSafeMode(false);
     OSIncrementAtomic(&gHangKills);
+}
+
+// gfx_v11_0_set_safe_mode / gfx_v11_0_unset_safe_mode
+void PhxBringup::rlcSafeMode(bool enter) const {
+    if (enter) {
+        wreg(kRegRlcSafeMode, 0x3);                    // CMD | MESSAGE 1: enter
+        for (int i = 0; i < 1000 && (rreg(kRegRlcSafeMode) & 1); i++)
+            IODelay(1);
+    } else {
+        wreg(kRegRlcSafeMode, 0x1);                    // CMD, MESSAGE 0: exit
+    }
 }
 
 IOReturn PhxBringup::doorbellWrite(uint64_t byteOff, uint64_t value) {
@@ -1529,6 +1586,91 @@ void PhxBringup::pmPolicy(const phx_smu13_0_4_metrics &m) {
     }
 }
 
+// ---- GFXOFF ----------------------------------------------------------------------------------------------------
+// Linux amdgpu_gfx_off_ctrl: a request count; the first request sends DisallowGfxOff (the PMFW answers once GFX is up),
+// the last release lets AllowGfxOff go out after a delay (gfx_off_delay_work, 100 ms) so a burst of accesses does not
+// toggle the power island each time.
+void PhxBringup::gfxAwake() const {
+    if (!gfxLock)
+        return;
+    IOLockLock(gfxLock);
+    gfxRef++;
+    if (gfxOffAllowed) {
+        uint32_t resp = 0, after = 0;
+        const_cast<PhxBringup *>(this)->smuMessage(PHX_PPSMC_DisallowGfxOff, 0, &resp, &after);
+        if (resp != PHX_PPSMC_Result_OK)
+            gPm.errors++;
+        gfxOffAllowed = false;
+        gPm.gfxWakes++;
+        gPm.gfxoffState = 2;
+    }
+    IOLockUnlock(gfxLock);
+}
+
+void PhxBringup::gfxRelease() const {
+    if (!gfxLock)
+        return;
+    IOLockLock(gfxLock);
+    if (gfxRef > 0)
+        gfxRef--;
+    gfxLastUse = mach_absolute_time();
+    IOLockUnlock(gfxLock);
+}
+
+// From the PM tick: turn RLC power gating on/off as debug.phx_pm_gfxoff asks, and re-allow GFXOFF once no GC access
+// has happened for debug.phx_pm_gfxoff_delay_ms.
+void PhxBringup::gfxoffPolicy() {
+    if (!gfxLock || !mmio)
+        return;
+    const bool want = gPmGfxoff == 1 && gpuReady() && pmReady;
+    if (want && !gfxPgOn) {
+        // gfx_v11_cntl_pg(adev, true): GFX is up here (GFXOFF has not been allowed yet)
+        rlcSafeMode(true);
+        uint32_t pg = rreg(kRegRlcPgCntl);
+        pg = (pg | kRlcPgGfxPowerGating) & ~kRlcPgSmuHandshakeDisable;
+        wreg(kRegRlcPgCntl, pg);
+        wreg(kRegRlcPgDelay3, kRlcPgDelay3Gc1101);
+        rlcSafeMode(false);
+        gfxPgOn = true;
+        IOLog("PhxBringup: gfxoff: RLC power gating on (RLC_PG_CNTL 0x%x)\n", pg);
+    } else if (!want && gfxPgOn) {
+        // gfx_v11_0_set_powergating_state(UNGATE): DisallowGfxOff first, then RLC power gating off
+        IOLockLock(gfxLock);
+        if (gfxOffAllowed) {
+            uint32_t resp = 0, after = 0;
+            smuMessage(PHX_PPSMC_DisallowGfxOff, 0, &resp, &after);
+            gfxOffAllowed = false;
+            gPm.gfxWakes++;
+        }
+        IOLockUnlock(gfxLock);
+        rlcSafeMode(true);
+        wreg(kRegRlcPgCntl, rreg(kRegRlcPgCntl) & ~kRlcPgGfxPowerGating);
+        rlcSafeMode(false);
+        gfxPgOn = false;
+        gPm.gfxoffState = 0;
+        IOLog("PhxBringup: gfxoff: off\n");
+        return;
+    }
+    if (!gfxPgOn)
+        return;
+    IOLockLock(gfxLock);
+    if (!gfxOffAllowed && gfxRef == 0) {
+        uint64_t delay, now = mach_absolute_time();
+        nanoseconds_to_absolutetime(static_cast<uint64_t>(gPmGfxoffDelayMs > 0 ? gPmGfxoffDelayMs : 0) * 1000000ull, &delay);
+        if (now - gfxLastUse >= delay) {
+            uint32_t resp = 0, after = 0;
+            if (smuMessage(PHX_PPSMC_AllowGfxOff, 0, &resp, &after) == kIOReturnSuccess && resp == PHX_PPSMC_Result_OK) {
+                gfxOffAllowed = true;
+                gPm.gfxAllows++;
+                gPm.gfxoffState = 1;
+            } else {
+                gPm.errors++;
+            }
+        }
+    }
+    IOLockUnlock(gfxLock);
+}
+
 void PhxBringup::pmStep() {
     if (pmResync) {
         pmResync = false;
@@ -1577,6 +1719,7 @@ void PhxBringup::pmStep() {
         c0 += r;
     gPm.c0 = static_cast<int>(c0 / 8);
     pmPolicy(m);
+    gfxoffPolicy();
 }
 
 void PhxBringup::pmTick(thread_call_param_t self, thread_call_param_t) {
@@ -1605,9 +1748,15 @@ IOReturn PhxBringup::readRegs(uint32_t first, uint32_t count, uint32_t *out) {
     uint64_t len = mmio->getLength();
     if ((static_cast<uint64_t>(first) + count) * 4 > len)
         return kIOReturnBadArgument;
+    // a read inside GC while GFX is powered down returns nothing useful: wake it for the read
+    const bool gc = first < kGcRegEnd && first + count > kGcRegFirst;
+    if (gc)
+        gfxAwake();
     volatile uint32_t *r = reinterpret_cast<volatile uint32_t *>(mmio->getVirtualAddress());
     for (uint32_t i = 0; i < count; i++)
         out[i] = r[first + i];
+    if (gc)
+        gfxRelease();
     return kIOReturnSuccess;
 }
 
