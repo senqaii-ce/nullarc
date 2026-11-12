@@ -306,20 +306,19 @@ static void nvmtl_cache_touch(const char *path) {
 // writes this way and works there.
 static BOOL nvmtl_cache_store(NSData *data, NSString *path) {
     if (!data || !path.length) return NO;
-    static _Atomic unsigned seq;
-    char tmp[PATH_MAX];
+    static _Atomic unsigned seq, said;
+    char tmp[PATH_MAX]; const char *step = "open"; int e = 0;
     if (snprintf(tmp, sizeof tmp, "%s.tmp-%d-%u", path.fileSystemRepresentation, getpid(), atomic_fetch_add(&seq, 1)) >= (int)sizeof tmp) return NO;
     int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-    if (fd < 0) {
-        static _Atomic int said;
-        if (!atomic_exchange(&said, 1)) nvlog("cache store: cannot create %s: %s - nothing is cached in this process", tmp, strerror(errno));
-        return NO;
+    BOOL ok = fd >= 0; if (!ok) e = errno;
+    if (ok) {
+        const uint8_t *b = data.bytes; size_t left = data.length;
+        while (left) { ssize_t w = write(fd, b, left); if (w < 0) { if (errno == EINTR) continue; ok = NO; e = errno; step = "write"; break; } b += w; left -= (size_t)w; }
+        if (close(fd) != 0 && ok) { ok = NO; e = errno; step = "close"; }
+        if (ok && rename(tmp, path.fileSystemRepresentation) != 0) { ok = NO; e = errno; step = "rename"; }
+        if (!ok) unlink(tmp);
     }
-    const uint8_t *b = data.bytes; size_t left = data.length; BOOL ok = YES;
-    while (left) { ssize_t w = write(fd, b, left); if (w < 0) { if (errno == EINTR) continue; ok = NO; break; } b += w; left -= (size_t)w; }
-    if (close(fd) != 0) ok = NO;
-    if (ok && rename(tmp, path.fileSystemRepresentation) != 0) ok = NO;
-    if (!ok) unlink(tmp);
+    if (!ok && atomic_fetch_add(&said, 1) < 4) nvlog("cache store: %s failed for %s: %s", step, tmp, strerror(e));
     return ok;
 }
 static BOOL nvmtl_cache_store_text(NSString *text, NSString *path) { return nvmtl_cache_store([text dataUsingEncoding:NSUTF8StringEncoding], path); }
@@ -1072,7 +1071,7 @@ static NSDictionary *nvmtl_index_metallib_disk(NSData *lib, NSData *key, NSDicti
         NSData *out = [NSPropertyListSerialization dataWithPropertyList:@{@"v": @1, @"length": @(lib.length), @"blobs": rec, @"externs": ext}
                                                                  format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
         NSString *tmp = [p stringByAppendingFormat:@".%d.tmp", getpid()];
-        if (out && [out writeToFile:tmp atomically:NO] && rename(tmp.fileSystemRepresentation, p.fileSystemRepresentation) == 0)
+        if (out && nvmtl_cache_store(out, p))
             nvlog("library index: disk record stored (%lu blobs, %lu externs) %s", (unsigned long)rec.count, (unsigned long)ext.count, p.lastPathComponent.UTF8String);
         else { unlink(tmp.fileSystemRepresentation); nvlog("library index: could not store the disk record %s", p.lastPathComponent.UTF8String); }
     }
@@ -1139,7 +1138,7 @@ NSData *nvmtl_libkey_for_file(NSString *path, NSData *lib, const struct stat *be
     memcpy(r.edge, edge, sizeof edge); memcpy(r.key, key.bytes, sizeof r.key);
     [[NSFileManager defaultManager] createDirectoryAtPath:nvmtl_aircache_dir() withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *tmp = [rp stringByAppendingFormat:@".%d.tmp", getpid()];
-    if ([[NSData dataWithBytes:&r length:sizeof r] writeToFile:tmp atomically:NO] && rename(tmp.fileSystemRepresentation, rp.fileSystemRepresentation) == 0) {
+    if (nvmtl_cache_store([NSData dataWithBytes:&r length:sizeof r], rp)) {
         const unsigned long st = atomic_fetch_add(&gLkStored, 1) + 1;
         if (!(st & (st - 1))) nvlog("library key memo: stored %lu (%lu B %s)", st, (unsigned long)lib.length, path.lastPathComponent.UTF8String);
     } else { unlink(tmp.fileSystemRepresentation); nvlog("library key memo: could not store %s", name); }
