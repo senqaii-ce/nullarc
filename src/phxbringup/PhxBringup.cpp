@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 43u
+#define PHX_KEXT_BUILD 44u
 #include <sys/proc.h>
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
@@ -73,7 +73,7 @@ static int gPmGfxoffDelayMs = 100;
 // interrupts CGCG waits on, and SDMA0's CGCG, inside RLC safe mode. The bring-up leaves every override set, so the GFX
 // clocks never stopped: idle package power 8.0 W -> 6.5 W on AC with it on (2026-11-13; luuumi-dev/nullarc#14 saw
 // 8.8 -> 6.75 W). Checked every few seconds and set again if a GPU re-init cleared it. 0 restores the old values.
-static int gPmCg = 0;
+static int gPmCg = 1;
 static struct {
     int state;                  // 0 not started, 1 running, -1 not SMU 13.0.4, -2 no VRAM window, -3 driver table refused, -4 gave up
     int dpmMin, dpmMax;         // the PMFW's GFX range (DpmClocks_t MinGfxClk / MaxGfxClk)
