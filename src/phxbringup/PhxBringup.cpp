@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 38u
+#define PHX_KEXT_BUILD 39u
 #include <sys/proc.h>
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
@@ -173,7 +173,7 @@ static constexpr uint64_t kGttMaxBo = 512ull << 20;
 static volatile SInt64 gMemBytes, gMemPeak;
 static int gMemCapMb = 6144;
 static volatile SInt32 gMemRefVis, gMemRefHi, gMemRefGtt, gMemRefCap, gMemRefHandles, gMemRefMaps, gMemRefPt,
-    gMemRefAlloc, gMemRefHost, gMemRefLogged;
+    gMemRefAlloc, gMemRefHost, gMemRefLogged, gMemDeferred, gMemCloseBusy;
 SYSCTL_QUAD(_debug, OID_AUTO, phx_mem_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gMemBytes,
             "bytes of BOs and host imports held by all clients");
 SYSCTL_QUAD(_debug, OID_AUTO, phx_mem_peak, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gMemPeak, "peak of phx_mem_bytes");
@@ -189,11 +189,14 @@ PHX_MEM_RO(phx_mem_ref_maps, gMemRefMaps, "GPU mappings refused: the client had 
 PHX_MEM_RO(phx_mem_ref_pt, gMemRefPt, "GPU mappings refused: the client's page tables were full");
 PHX_MEM_RO(phx_mem_ref_alloc, gMemRefAlloc, "BOs refused: the kernel had no memory for them");
 PHX_MEM_RO(phx_mem_ref_host, gMemRefHost, "host imports refused: the client's import budget was full");
+PHX_MEM_RO(phx_mem_deferred, gMemDeferred, "BOs freed while the GPU still had the client's work: released once it retired");
+PHX_MEM_RO(phx_mem_close_busy, gMemCloseBusy, "clients closed while the GPU was still running their work after the wait");
 static struct sysctl_oid *const kMemOids[] = {
     &sysctl__debug_phx_mem_bytes, &sysctl__debug_phx_mem_peak, &sysctl__debug_phx_mem_cap_mb,
     &sysctl__debug_phx_mem_ref_vis, &sysctl__debug_phx_mem_ref_hi, &sysctl__debug_phx_mem_ref_gtt,
     &sysctl__debug_phx_mem_ref_cap, &sysctl__debug_phx_mem_ref_handles, &sysctl__debug_phx_mem_ref_maps,
     &sysctl__debug_phx_mem_ref_pt, &sysctl__debug_phx_mem_ref_alloc, &sysctl__debug_phx_mem_ref_host,
+    &sysctl__debug_phx_mem_deferred, &sysctl__debug_phx_mem_close_busy,
 };
 // Counts a refusal; the first few are logged with the calling process (externalMethod runs on the caller's thread).
 static void memRefused(volatile SInt32 *counter, const char *why, uint64_t size) {
@@ -428,6 +431,19 @@ private:
     IOReturn doBoFree(IOExternalMethodArguments *a);
     IOReturn doBoImportHost(IOExternalMethodArguments *a);
     void boRelease(Bo &b);
+    void boUnmapAll(uint32_t h);
+    void reapZombies(bool all);
+    // A BO freed while the GPU may still run this client's work: its memory is held until the GPU retires lastSeq,
+    // as amdgpu keeps a BO until its fences signal. Releasing it at once let the GPU (and its L2's write-backs) land in
+    // pages the kernel had already handed to someone else.
+    struct Zombie {
+        IOMemoryDescriptor *md;
+        uint64_t size, seq;
+        bool host;
+    };
+    static constexpr uint32_t kMaxZombies = 1024;
+    Zombie *zombies{nullptr};
+    uint32_t nZombies{0};
     IOReturn doGemVa(IOExternalMethodArguments *a);
     IOReturn doCtx(IOExternalMethodArguments *a);
     IOReturn doSubmit(IOExternalMethodArguments *a);
@@ -1865,7 +1881,8 @@ bool IOAccelPhxNativeClient::initWithTask(task_t owningTask, void *securityID, U
     lock = IOLockAlloc();
     bos = static_cast<Bo *>(IOMallocZero(sizeof(Bo) * PHXN_MAX_BOS));
     maps = static_cast<Map *>(IOMallocZero(sizeof(Map) * kMaxMaps));
-    return lock && bos && maps;
+    zombies = static_cast<Zombie *>(IOMallocZero(sizeof(Zombie) * kMaxZombies));
+    return lock && bos && maps && zombies;
 }
 
 bool IOAccelPhxNativeClient::start(IOService *provider) {
@@ -1878,24 +1895,29 @@ bool IOAccelPhxNativeClient::start(IOService *provider) {
     return IOUserClient::start(provider);
 }
 
+// Only after vmidFree: the GPU is past this client's work (or its tables are cleared), so nothing reaches these pages.
 void IOAccelPhxNativeClient::freeAll() {
-    if (!bos)
-        return;
-    for (uint32_t h = 1; h < PHXN_MAX_BOS; h++)
-        if (bos[h].md)
-            boRelease(bos[h]);
+    if (bos)
+        for (uint32_t h = 1; h < PHXN_MAX_BOS; h++)
+            if (bos[h].md)
+                boRelease(bos[h]);
+    reapZombies(true);
 }
 
 IOReturn IOAccelPhxNativeClient::clientClose() {
+    // The GPU first: vmidFree waits for this client's last submission and clears its page tables. Build 38 and older
+    // freed the BOs before that, so work still in flight when a process quit wrote into freed pages.
+    if (vmid && owner) {
+        if (owner->gpuReady() && owner->gpuRetired() < lastSeq)
+            OSIncrementAtomic(&gMemCloseBusy);
+        owner->vmidFree(vmid, lastSeq);
+        vmid = 0;
+    }
     if (lock)
         IOLockLock(lock);
     freeAll();
     if (lock)
         IOLockUnlock(lock);
-    if (vmid && owner) {
-        owner->vmidFree(vmid, lastSeq);
-        vmid = 0;
-    }
     if (sessionClaimed && owner) {
         owner->releaseSession();
         sessionClaimed = false;
@@ -1916,6 +1938,8 @@ void IOAccelPhxNativeClient::free() {
         IOFree(bos, sizeof(Bo) * PHXN_MAX_BOS);
     if (maps)
         IOFree(maps, sizeof(Map) * kMaxMaps);
+    if (zombies)
+        IOFree(zombies, sizeof(Zombie) * kMaxZombies);
     if (lock)
         IOLockFree(lock);
     IOUserClient::free();
@@ -2082,6 +2106,7 @@ IOReturn IOAccelPhxNativeClient::doBoCreate(IOExternalMethodArguments *a) {
         return kIOReturnBadArgument;
     if (align < 4096)
         align = 4096;
+    reapZombies(false);
     const uint64_t d = in->domains, f = in->domain_flags;
     if (d == 0 || (d & ~static_cast<uint64_t>(PHX_AMDGPU_GEM_DOMAIN_GTT | PHX_AMDGPU_GEM_DOMAIN_VRAM)))
         return kIOReturnUnsupported;
@@ -2157,9 +2182,8 @@ IOReturn IOAccelPhxNativeClient::doBoFree(IOExternalMethodArguments *a) {
     Bo *b = findBo(h);
     if (!b)
         return kIOReturnNotFound;
-    for (int i = 0; i < kMaxMaps; i++)
-        if (maps[i].used && maps[i].handle == h)
-            maps[i].used = false;
+    reapZombies(false);
+    boUnmapAll(h);
     if (b->host)
         hostUsed -= b->size;
     else if (b->domain == 2)
@@ -2168,8 +2192,52 @@ IOReturn IOAccelPhxNativeClient::doBoFree(IOExternalMethodArguments *a) {
         hiUsed -= b->size;
     else
         visUsed -= b->size;
+    if (owner->gpuReady() && owner->gpuRetired() < lastSeq) {
+        if (nZombies == kMaxZombies) {
+            for (int i = 0; i < 2000 && owner->gpuRetired() < lastSeq; i++)
+                IOSleep(1);
+            reapZombies(false);
+            if (nZombies == kMaxZombies)
+                reapZombies(true);   // the GPU is stuck: its tables no longer reach these pages (boUnmapAll)
+        }
+        zombies[nZombies++] = Zombie{b->md, b->size, lastSeq, b->host};
+        OSIncrementAtomic(&gMemDeferred);
+        *b = Bo{};
+        return kIOReturnSuccess;
+    }
     boRelease(*b);
     return kIOReturnSuccess;
+}
+
+// Drops every GPU mapping of handle h: the map slots and the page table entries (and the TLB) behind them.
+void IOAccelPhxNativeClient::boUnmapAll(uint32_t h) {
+    for (int i = 0; i < kMaxMaps; i++) {
+        if (maps[i].used && maps[i].handle == h) {
+            if (vmid)
+                owner->vmUnmap(vmid, maps[i].va, maps[i].size);
+            maps[i].used = false;
+        }
+    }
+}
+
+// Releases the deferred BOs the GPU is done with (all of them when all is set).
+void IOAccelPhxNativeClient::reapZombies(bool all) {
+    if (!zombies || !nZombies)
+        return;
+    const uint64_t done = (owner && owner->gpuReady()) ? owner->gpuRetired() : ~0ull;
+    uint32_t keep = 0;
+    for (uint32_t i = 0; i < nZombies; i++) {
+        Zombie &z = zombies[i];
+        if (!all && z.seq > done) {
+            zombies[keep++] = z;
+            continue;
+        }
+        if (z.host)
+            z.md->complete();
+        z.md->release();
+        memUncharge(z.size);
+    }
+    nZombies = keep;
 }
 
 void IOAccelPhxNativeClient::boRelease(Bo &b) {
