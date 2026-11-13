@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 44u
+#define PHX_KEXT_BUILD 45u
 #include <sys/proc.h>
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
@@ -1870,6 +1870,11 @@ void PhxBringup::pmStep() {
         c0 += r;
     gPm.c0 = static_cast<int>(c0 / 8);
     pmPolicy(m);
+    // After a wake the GC is in its power-on state until the bring-up adopts the queues again (suspended): no RLC
+    // safe mode, power gating or clock gating writes before that. cgPolicy re-applies clock gating afterwards, since
+    // its override register reads the reset value then.
+    if (suspended)
+        return;
     gfxoffPolicy();
     cgPolicy();
 }
