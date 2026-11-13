@@ -1009,7 +1009,19 @@ static int nvtrace_scope(uint32_t w, uint32_t h) { int was = g_trace_mute; g_tra
     g_trace_mute = g_trace_bigonly && (w < 1000 || h < 100); return was; }
 static void nvtrace_emit(const char *fmt, ...) {
     if (!nvmtl_trace_on()) return;
-    char p[96]; snprintf(p, sizeof p, "/tmp/nvmtl-trace-%d.txt", (int)getpid());
+    // A sandboxed app (Photo Booth, WebKit's GPU process) may not write /tmp: fall back to its own TMPDIR, as the frame
+    // dumps do. The path is chosen once per process.
+    static char p[400]; static int chosen;
+    if (!chosen) {
+        snprintf(p, sizeof p, "/tmp/nvmtl-trace-%d.txt", (int)getpid());
+        int t = open(p, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (t < 0 && (errno == EPERM || errno == EACCES)) {
+            const char *d = getenv("TMPDIR");
+            if (d && *d) { size_t dl = strlen(d);
+                snprintf(p, sizeof p, "%s%snvmtl-trace-%d.txt", d, (dl && d[dl - 1] == '/') ? "" : "/", (int)getpid()); }
+        } else if (t >= 0) close(t);
+        chosen = 1; nvlog("G15 trace: writing to %s", p);
+    }
     int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (fd < 0) { static int said; if (!said++) nvlog("G15 trace: cannot open %s (errno %d)", p, errno); return; }
     char b[700]; va_list a; va_start(a, fmt); int n = vsnprintf(b, sizeof b - 1, fmt, a); va_end(a);
