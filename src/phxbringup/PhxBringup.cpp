@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 39u
+#define PHX_KEXT_BUILD 40u
 #include <sys/proc.h>
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
@@ -68,6 +68,12 @@ static int gPmStepDown = 300;   // governor: MHz the cap may fall per tick
 // kill, register reads) runs between DisallowGfxOff and a delayed AllowGfxOff (Linux amdgpu_gfx_off_ctrl).
 static int gPmGfxoff = 0;
 static int gPmGfxoffDelayMs = 100;
+// debug.phx_pm_cg: GFX clock gating as Linux sets it on GC 11.0.1 (gfx_v11_0_update_gfx_clock_gating): medium grain
+// (RLC_CGTT_MGCG_OVERRIDE) and coarse grain + light sleep (RLC_CGCG_CGLS_CTRL and _3D), the CP's WPTR poll and GUI idle
+// interrupts CGCG waits on, and SDMA0's CGCG, inside RLC safe mode. The bring-up leaves every override set, so the GFX
+// clocks never stopped: idle package power 8.0 W -> 6.5 W on AC with it on (2026-11-13; luuumi-dev/nullarc#14 saw
+// 8.8 -> 6.75 W). Checked every few seconds and set again if a GPU re-init cleared it. 0 restores the old values.
+static int gPmCg = 1;
 static struct {
     int state;                  // 0 not started, 1 running, -1 not SMU 13.0.4, -2 no VRAM window, -3 driver table refused, -4 gave up
     int dpmMin, dpmMax;         // the PMFW's GFX range (DpmClocks_t MinGfxClk / MaxGfxClk)
@@ -77,7 +83,8 @@ static struct {
     int hardMin, softMax;       // what the kext last sent (0 = nothing)
     int updates, errors, vramWasZero;
     int gfxoffState;            // 0 off, 1 GFX may power down (AllowGfxOff sent), 2 held on by a register access
-    int gfxWakes, gfxAllows;    // DisallowGfxOff / AllowGfxOff messages sent
+    int gfxWakes, gfxAllows;
+    int cgState, cgApplies;     // clock gating: 1 on, 0 off; times it was (re)applied    // DisallowGfxOff / AllowGfxOff messages sent
 } gPm;
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmMs, 0, "SMU metrics period, ms (0 off)");
 SYSCTL_INT(_debug, OID_AUTO, phx_pm_mode, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmMode, 0,
@@ -120,6 +127,9 @@ PHX_PM_RO(phx_pm_vram_was_zero, vramWasZero, "the table page was clear before fi
 PHX_PM_RO(phx_pm_gfxoff_state, gfxoffState, "0 off, 1 GFX may power down, 2 held on for a register access");
 PHX_PM_RO(phx_pm_gfx_wakes, gfxWakes, "DisallowGfxOff sent (GC register access while GFXOFF was allowed)");
 PHX_PM_RO(phx_pm_gfx_allows, gfxAllows, "AllowGfxOff sent");
+PHX_PM_RO(phx_pm_cg_state, cgState, "GFX clock gating: 1 on, 0 off");
+PHX_PM_RO(phx_pm_cg_applies, cgApplies, "times GFX clock gating was (re)applied");
+SYSCTL_INT(_debug, OID_AUTO, phx_pm_cg, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmCg, 0, "GFX clock gating (MGCG + CGCG/CGLS): 1 on, 0 off");
 static struct sysctl_oid *const kPmOids[] = {
     &sysctl__debug_phx_pm_ms, &sysctl__debug_phx_pm_mode, &sysctl__debug_phx_pm_gfx_max,
     &sysctl__debug_phx_pm_up, &sysctl__debug_phx_pm_target, &sysctl__debug_phx_pm_step_down,
@@ -133,6 +143,7 @@ static struct sysctl_oid *const kPmOids[] = {
     &sysctl__debug_phx_pm_softmax, &sysctl__debug_phx_pm_updates, &sysctl__debug_phx_pm_errors,
     &sysctl__debug_phx_pm_vram_was_zero, &sysctl__debug_phx_pm_gfxoff, &sysctl__debug_phx_pm_gfxoff_delay_ms,
     &sysctl__debug_phx_pm_gfxoff_state, &sysctl__debug_phx_pm_gfx_wakes, &sysctl__debug_phx_pm_gfx_allows,
+    &sysctl__debug_phx_pm_cg_state, &sysctl__debug_phx_pm_cg_applies, &sysctl__debug_phx_pm_cg,
 };
 // GC 11.0.1 registers (segment 0 base 0x1260, segment 1 base 0xa000)
 static constexpr uint32_t kRegSqCmd = 0x1260 + 0x111b, kRegRlcSafeMode = 0xa000 + 0x0980;
@@ -380,6 +391,10 @@ private:
     mutable bool gfxOffAllowed{false};
     mutable uint64_t gfxLastUse{0};
     bool gfxPgOn{false};
+    bool cgOn{false}, cgSaved{false};
+    uint32_t cgOld[6]{};
+    uint32_t cgChecks{0};
+    void cgPolicy();
     void gfxAwake() const;
     void gfxRelease() const;
     void gfxoffPolicy();
@@ -1800,6 +1815,52 @@ void PhxBringup::pmStep() {
     gPm.c0 = static_cast<int>(c0 / 8);
     pmPolicy(m);
     gfxoffPolicy();
+    cgPolicy();
+}
+
+// RLC_CGTT_MGCG_OVERRIDE, RLC_CGCG_CGLS_CTRL, RLC_CGCG_CGLS_CTRL_3D, CP_RB_WPTR_POLL_CNTL, CP_INT_CNTL_RING0,
+// SDMA0_RLC_CGCG_CTRL (dwords, GC 11.0.1 / SDMA 6.0.1)
+static constexpr uint32_t kCgRegs[6] = {0xEC48, 0xEC49, 0xECC5, 0x21C2, 0x306A, 0x12BC};
+static constexpr uint32_t kCgMgcgOverrideOn = 0x000600c1;   // what Linux leaves: MGCG/CGCG/CGLS overrides clear
+static constexpr uint32_t kCgCgcgCglsCtrlOn = 0x0000363f;   // CGCG_EN | CGLS_EN, Linux's idle threshold and CGLS rep
+
+// From the PM tick: GFX clock gating on/off as debug.phx_pm_cg asks.
+void PhxBringup::cgPolicy() {
+    if (!mmio || !gpuReady())
+        return;
+    const bool want = gPmCg == 1;
+    if (want && cgOn && (++cgChecks & 15))
+        return;                                   // on: look at the override register every 16th tick
+    GfxGuard awake(this);
+    if (want) {
+        if (cgOn && rreg(kCgRegs[0]) == kCgMgcgOverrideOn)
+            return;
+        if (!cgSaved) {
+            for (int i = 0; i < 6; i++)
+                cgOld[i] = rreg(kCgRegs[i]);
+            cgSaved = true;
+        }
+        rlcSafeMode(true);
+        wreg(kCgRegs[0], kCgMgcgOverrideOn);
+        wreg(kCgRegs[1], kCgCgcgCglsCtrlOn);
+        wreg(kCgRegs[2], kCgCgcgCglsCtrlOn);
+        wreg(kCgRegs[3], 0x00900100);             // CP_RB_WPTR_POLL_CNTL: poll frequency 0x100, idle poll count 0x90
+        wreg(kCgRegs[4], rreg(kCgRegs[4]) | 0x003c0000);   // CNTX_BUSY/EMPTY, CMP_BUSY, GFX_IDLE interrupt enables
+        wreg(kCgRegs[5], rreg(kCgRegs[5]) | 0x2);           // SDMA0 CGCG enable
+        rlcSafeMode(false);
+        cgOn = true;
+        gPm.cgState = 1;
+        gPm.cgApplies++;
+        IOLog("PhxBringup: clock gating on (MGCG override 0x%x -> 0x%x)\n", cgOld[0], rreg(kCgRegs[0]));
+    } else if (cgOn) {
+        rlcSafeMode(true);
+        for (int i = 0; i < 6; i++)
+            wreg(kCgRegs[i], cgOld[i]);
+        rlcSafeMode(false);
+        cgOn = false;
+        gPm.cgState = 0;
+        IOLog("PhxBringup: clock gating off\n");
+    }
 }
 
 void PhxBringup::pmTick(thread_call_param_t self, thread_call_param_t) {
