@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 40u
+#define PHX_KEXT_BUILD 41u
 #include <sys/proc.h>
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
@@ -336,6 +336,9 @@ private:
     uint64_t gSeq{0};
     uint64_t queueFence(const GpuQueue &q) const;
     IOLock *gpuLock{nullptr};
+    // RLC safe mode is one state for the whole GFX block: the hang watchdog (killWaves) and the PM tick (gfxoffPolicy,
+    // cgPolicy) run on separate thread calls, so entering and leaving it is serialized.
+    IOLock *rlcLock{nullptr};
     // One GPUVM context (page tables) per client, and the eight hardware VMIDs lent to contexts at submission time,
     // as amdgpu does: a fixed VMID per client capped Metal at eight processes, and with every app allowed Metal the
     // ninth got no device (2026-10-20). A context's handle is its index + 1.
@@ -553,6 +556,7 @@ bool PhxBringup::start(IOService *provider) {
     doorbellMap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
     smuLock = IOLockAlloc();
     gpuLock = IOLockAlloc();
+    rlcLock = IOLockAlloc();
     gfxLock = IOLockAlloc();
     uint32_t dbg = 0;
     debug = PE_parse_boot_argn("phxdebug", &dbg, sizeof(dbg)) && dbg == 1;
@@ -640,6 +644,10 @@ void PhxBringup::stop(IOService *provider) {
     if (gpuLock) {
         IOLockFree(gpuLock);
         gpuLock = nullptr;
+    }
+    if (rlcLock) {
+        IOLockFree(rlcLock);
+        rlcLock = nullptr;
     }
     if (doorbellMap) {
         doorbellMap->release();
@@ -1233,14 +1241,18 @@ void PhxBringup::killWaves(uint32_t vmid, bool all) {
     OSIncrementAtomic(&gHangKills);
 }
 
-// gfx_v11_0_set_safe_mode / gfx_v11_0_unset_safe_mode
+// gfx_v11_0_set_safe_mode / gfx_v11_0_unset_safe_mode; rlcLock is held from enter to exit
 void PhxBringup::rlcSafeMode(bool enter) const {
     if (enter) {
+        if (rlcLock)
+            IOLockLock(rlcLock);
         wreg(kRegRlcSafeMode, 0x3);                    // CMD | MESSAGE 1: enter
         for (int i = 0; i < 1000 && (rreg(kRegRlcSafeMode) & 1); i++)
             IODelay(1);
     } else {
         wreg(kRegRlcSafeMode, 0x1);                    // CMD, MESSAGE 0: exit
+        if (rlcLock)
+            IOLockUnlock(rlcLock);
     }
 }
 
