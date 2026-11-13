@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 42u
+#define PHX_KEXT_BUILD 43u
 #include <sys/proc.h>
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
@@ -2193,15 +2193,17 @@ IOReturn IOAccelPhxNativeClient::doBoCreate(IOExternalMethodArguments *a) {
     uint64_t *pool = nullptr;
     const bool gttOk = (d & PHX_AMDGPU_GEM_DOMAIN_GTT) && size <= kGttMaxBo && gttUsed + size <= kGttCap;
     if (d & PHX_AMDGPU_GEM_DOMAIN_VRAM) {
+        // Visible pool first, the high pool only once it is full (as build 37 did): build 38-42 put every
+        // CPU-inaccessible BO in the high pool from the start, and the machine began to reset with no panic.
         const bool noCpu = (f & PHX_AMDGPU_GEM_CREATE_NO_CPU_ACCESS) && !(f & PHX_AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED);
-        if (noCpu && hiUsed + size <= kHiTotal) {
-            domain = 4;
-            bits = PHXN_PLACED_HI_POOL | PHXN_PLACED_ZEROED;
-            pool = &hiUsed;
-        } else if (visUsed + size <= kVisTotal) {
+        if (visUsed + size <= kVisTotal) {
             domain = 4;
             bits = PHXN_PLACED_CPU_MAPPABLE | PHXN_PLACED_ZEROED;
             pool = &visUsed;
+        } else if (noCpu && hiUsed + size <= kHiTotal) {
+            domain = 4;
+            bits = PHXN_PLACED_HI_POOL | PHXN_PLACED_ZEROED;
+            pool = &hiUsed;
         } else if (!gttOk) {
             memRefused(noCpu ? &gMemRefHi : &gMemRefVis, noCpu ? "VRAM (both pools full)" : "CPU-visible VRAM", size);
             return kIOReturnNoMemory;
