@@ -4,7 +4,7 @@
 //
 // A wake from hibernation is a cold boot. When a boot menu (Limine, systemd-boot, GRUB, rEFInd) comes before OpenCore,
 // it would show up on every wake. phxresume.py setup records how to skip it once in /usr/local/etc/phxwake-resume:
-//   bli <entry id>   Boot Loader Interface: LoaderEntryOneShot = entry, LoaderConfigTimeoutOneShot = "0"
+//   bli <entry id>   Boot Loader Interface: LoaderEntryOneShot = entry, LoaderConfigTimeoutOneShot = "menu-disabled"
 //   bootnext <####>  UEFI BootNext = Boot#### (a firmware boot option for the resuming OpenCore)
 // It is set as the system goes to sleep (only when PhxSleepPolicy makes that sleep a hibernation) and deleted again
 // after the wake and when the sleep is called off; the boot loader or the firmware drops it once used.
@@ -87,7 +87,7 @@ static void resumeSet(void) {
     if (gMode == kBli) {
         UInt8 b[300]; CFIndex n = utf16(gEntry, b, sizeof b);
         r = nvramSetRaw(ONESHOT, b, n);
-        UInt8 z[4]; CFIndex zn = utf16("0", z, sizeof z);
+        UInt8 z[32]; CFIndex zn = utf16("menu-disabled", z, sizeof z);   // "0" would mean: show the menu, no timeout
         if (!r) r = nvramSetRaw(TIMEOUT1, z, zn);
         snprintf(m, sizeof m, "next boot: entry %s, no menu (LoaderEntryOneShot) %s", gEntry, r ? "FAILED" : "set");
     } else {

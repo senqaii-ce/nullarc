@@ -7,7 +7,8 @@ by hand. Both ways of telling the next boot where to go are one-shot: they apply
 
   bli       The Boot Loader Interface (systemd's spec; Limine and systemd-boot implement it). The menu reports itself in
             LoaderInfo and the entry it started in LoaderEntrySelected; LoaderEntryOneShot picks the entry of the next
-            boot and LoaderConfigTimeoutOneShot=0 skips the menu once. Used whenever the running boot came through such
+            boot and LoaderConfigTimeoutOneShot="menu-disabled" skips the menu once (a one-shot "0"
+            would instead show the menu with no timeout). Used whenever the running boot came through such
             a menu. setup records the entry this macOS was started from (it has to be the resuming one).
   bootnext  UEFI BootNext to a firmware boot option (Boot####, not put into BootOrder) for the OpenCore whose config has
             HibernateMode other than None. Only for menus without the interface, and only when OpenCore's
